@@ -3,6 +3,7 @@ import pdfplumber
 import pandas as pd
 import re
 import io
+import os # Tambahan modul untuk mengambil nama file asli
 
 # --- CONFIG ---
 st.set_page_config(page_title="Accounting CSV Converter", layout="wide")
@@ -135,6 +136,7 @@ def parse_panin(pdf):
                 
     if current_trx: data.append(current_trx)
     return pd.DataFrame(data)
+
 # --- PARSER BCA/MANDIRI ---
 def parse_generic(pdf, year):
     data = []
@@ -216,10 +218,14 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
             # --- DOWNLOAD BUTTON ---
             csv_string = df_final.to_csv(index=False, float_format='%.2f').encode('utf-8')
             
+            # Ambil nama file asli (tanpa .pdf) dan tambahkan .csv
+            original_filename, _ = os.path.splitext(uploaded_file.name)
+            output_filename = f"{original_filename}.csv"
+            
             st.download_button(
                 label="📥 Download CSV",
                 data=csv_string,
-                file_name=f"import_{bank_type.lower()}.csv",
+                file_name=output_filename,
                 mime="text/csv"
             )
         else:
