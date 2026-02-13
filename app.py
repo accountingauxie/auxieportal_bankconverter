@@ -24,10 +24,8 @@ def parse_number(text_val, is_indo_format=True):
     clean = str(text_val).strip()
     
     if is_indo_format:
-        # Format PANIN: 30.000,00 -> 30000.00
         clean = clean.replace('.', '').replace(',', '.')
     else:
-        # Format BCA / BRI: 14,530,000.00 -> 14530000.00
         clean = clean.replace(',', '')
         
     try:
@@ -35,7 +33,7 @@ def parse_number(text_val, is_indo_format=True):
     except:
         return 0.0
 
-# --- PARSER BRI (Format International) ---
+# --- PARSER BRI ---
 def parse_bri(pdf):
     data = []
     for page in pdf.pages:
@@ -51,12 +49,12 @@ def parse_bri(pdf):
                 data.append({
                     "Tanggal": str(row[0]).split(' ')[0].replace('/01/', '/01/20'), 
                     "Keterangan": str(row[1]).replace('\n', ' '),
-                    "Nominal": parse_number(nominal_raw, is_indo_format=False), # False = Intl
+                    "Nominal": parse_number(nominal_raw, is_indo_format=False),
                     "Jenis": "DB" if is_debet else "CR"
                 })
     return pd.DataFrame(data)
 
-# --- PARSER PANIN (Format Indonesia) ---
+# --- PARSER PANIN ---
 def parse_panin(pdf):
     data = []
     current_trx = None
@@ -68,10 +66,9 @@ def parse_panin(pdf):
         if not text: continue
         for line in text.split('\n'):
             if "SALDO" in line.upper():
-                # Tangkap pola angka Indo (contoh: 1.500.000,00)
                 amounts = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})', line)
                 if amounts and any(x in line.upper() for x in ["AWAL", "LALU", "PINDAH"]):
-                    saldo_terakhir = parse_number(amounts[-1], is_indo_format=True) # True = Indo
+                    saldo_terakhir = parse_number(amounts[-1], is_indo_format=True) 
             
             match = date_regex.search(line)
             if match:
@@ -119,12 +116,11 @@ def parse_panin(pdf):
     if current_trx: data.append(current_trx)
     return pd.DataFrame(data)
 
-# --- PARSER BCA/MANDIRI (Format International) ---
+# --- PARSER BCA/MANDIRI ---
 def parse_generic(pdf, year):
     data = []
     current_trx = None
     date_ptrn = re.compile(r'^(\d{2}/\d{2})\s')
-    # Tangkap pola angka Intl (contoh: 14,530,000.00)
     money_ptrn = re.compile(r'(\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2})')
     
     for page in pdf.pages:
@@ -138,7 +134,7 @@ def parse_generic(pdf, year):
                 current_trx = {
                     "Tanggal": f"{m.group(1)}/{year}",
                     "Keterangan": line.strip(), 
-                    "Nominal": parse_number(nominal_txt, is_indo_format=False), # False = Intl
+                    "Nominal": parse_number(nominal_txt, is_indo_format=False), 
                     "Jenis": "DB" if "DB" in line.upper() else "CR"
                 }
             elif current_trx: current_trx["Keterangan"] += " " + line.strip()
@@ -161,30 +157,44 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
         pdf.close()
         
         if not df.empty:
-            st.success(f"✅ Berhasil! {len(df)} transaksi.")
+            
+            # --- FILTER SALDO AWAL / AKHIR ---
+            # Kata kunci yang akan diblokir agar tidak masuk ke CSV
+            kata_kunci_blokir = ["SALDO AWAL", "SALDO AKHIR", "SALDO LALU"]
             
             csv_data = []
+            transaksi_valid = 0
+            
             for index, row in df.iterrows():
-                amount = row['Nominal']
-                if row['Jenis'] == 'DB':
-                    amount = -abs(amount)
+                ket_upper = str(row['Keterangan']).upper()
                 
-                csv_data.append({
-                    "*Date": row['Tanggal'],
-                    "*Amount": amount,  # Angka asli (Float), paling aman untuk import CSV ke sistem akunting
-                    "Payee": "",        # <--- DIKOSONGKAN SESUAI REQUEST
-                    "Description": row['Keterangan'],
-                    "Reference": "",     
-                    "Check Number": ""   
-                })
+                # Cek apakah baris ini adalah mutasi saldo awal/akhir
+                is_saldo_summary = any(k in ket_upper for k in kata_kunci_blokir)
+                
+                # Jika bukan ringkasan saldo, masukkan ke data CSV
+                if not is_saldo_summary:
+                    amount = row['Nominal']
+                    if row['Jenis'] == 'DB':
+                        amount = -abs(amount)
+                    
+                    csv_data.append({
+                        "*Date": row['Tanggal'],
+                        "*Amount": amount,  
+                        "Payee": "",        
+                        "Description": row['Keterangan'],
+                        "Reference": "",     
+                        "Check Number": ""   
+                    })
+                    transaksi_valid += 1
             
             df_final = pd.DataFrame(csv_data)
             
-            # Tampilkan preview di layar dengan format Intl (Koma pemisah ribuan)
+            st.success(f"✅ Berhasil! Ditemukan {len(df)} baris (Tersaring {transaksi_valid} transaksi valid).")
+            
+            # Tampilkan preview di layar dengan format Intl
             st.dataframe(df_final.style.format({"*Amount": "{:,.2f}"}))
             
             # --- DOWNLOAD BUTTON ---
-            # Export CSV dengan angka raw (e.g. 1509600000.00). Ini adalah standar baku Xero/Quickbooks.
             csv_string = df_final.to_csv(index=False, float_format='%.2f').encode('utf-8')
             
             st.download_button(
