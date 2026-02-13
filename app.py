@@ -108,7 +108,7 @@ def parse_panin(pdf):
                     "Nominal": nominal_float,
                     "Jenis": jenis
                 }
-            elif current_trx and not any(x in line for x in ["Halaman", "Saldo", "Mata", "Tgl. Transaksi"]):
+            elif current_trx and not any(x in line.upper() for x in ["HALAMAN", "SALDO", "MATA", "TGL. TRANSAKSI"]):
                 clean_line = re.sub(r'\d{1,3}(?:\.\d{3})*,\d{2}', '', line).strip()
                 if clean_line:
                     current_trx["Keterangan"] += " " + clean_line
@@ -137,7 +137,11 @@ def parse_generic(pdf, year):
                     "Nominal": parse_number(nominal_txt, is_indo_format=False), 
                     "Jenis": "DB" if "DB" in line.upper() else "CR"
                 }
-            elif current_trx: current_trx["Keterangan"] += " " + line.strip()
+            elif current_trx:
+                # PERBAIKAN: Jangan gabungkan baris summary/footer ke deskripsi transaksi terakhir
+                if not any(keyword in line.upper() for keyword in ["SALDO", "MUTASI", "HALAMAN", "PAGE"]):
+                    current_trx["Keterangan"] += " " + line.strip()
+                    
     if current_trx: data.append(current_trx)
     return pd.DataFrame(data)
 
@@ -159,7 +163,6 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
         if not df.empty:
             
             # --- FILTER SALDO AWAL / AKHIR ---
-            # Kata kunci yang akan diblokir agar tidak masuk ke CSV
             kata_kunci_blokir = ["SALDO AWAL", "SALDO AKHIR", "SALDO LALU"]
             
             csv_data = []
@@ -168,10 +171,9 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
             for index, row in df.iterrows():
                 ket_upper = str(row['Keterangan']).upper()
                 
-                # Cek apakah baris ini adalah mutasi saldo awal/akhir
+                # Cek apakah baris ini BENAR-BENAR sebuah mutasi awal/akhir (bukan tersangkut di deskripsi)
                 is_saldo_summary = any(k in ket_upper for k in kata_kunci_blokir)
                 
-                # Jika bukan ringkasan saldo, masukkan ke data CSV
                 if not is_saldo_summary:
                     amount = row['Nominal']
                     if row['Jenis'] == 'DB':
@@ -189,9 +191,8 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
             
             df_final = pd.DataFrame(csv_data)
             
-            st.success(f"✅ Berhasil! Ditemukan {len(df)} baris (Tersaring {transaksi_valid} transaksi valid).")
+            st.success(f"✅ Berhasil! Membaca {len(df)} baris (Tersaring {transaksi_valid} transaksi valid).")
             
-            # Tampilkan preview di layar dengan format Intl
             st.dataframe(df_final.style.format({"*Amount": "{:,.2f}"}))
             
             # --- DOWNLOAD BUTTON ---
