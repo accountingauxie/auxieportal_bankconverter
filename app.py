@@ -12,7 +12,7 @@ st.markdown("Output format CSV: `*Date`, `*Amount`, `Payee`, `Description`, `Ref
 # --- UI ---
 col1, col2 = st.columns(2)
 with col1:
-    bank_type = st.selectbox("1. Pilih Bank", ["BCA / Mandiri", "BRI", "Panin"])
+    bank_type = st.selectbox("1. Pilih Bank", ["BCA", "BRI", "Panin"])
     uploaded_file = st.file_uploader("2. Upload PDF", type="pdf")
 with col2:
     pdf_password = st.text_input("3. Password (Jika ada)", type="password")
