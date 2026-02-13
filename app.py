@@ -5,28 +5,34 @@ import re
 import io
 
 # --- KONFIGURASI HALAMAN ---
-st.set_page_config(page_title="Multi-Bank Converter", page_icon="💰")
+st.set_page_config(page_title="Multi-Bank Converter v4", page_icon="💰")
 st.title("💰 Multi-Bank Statement Converter")
-st.info("Pilih Bank sesuai file PDF agar sistem menggunakan mesin analisa yang tepat.")
+st.markdown("---")
 
 # --- PILIHAN BANK ---
-bank_type = st.selectbox("Pilih Format Bank", ["BCA / Mandiri", "BRI", "Panin"])
-uploaded_file = st.file_uploader("Upload File PDF Rekening Koran", type="pdf")
-tahun_input = st.text_input("Tahun Laporan (Hanya untuk BCA/Mandiri)", value="2026")
+bank_type = st.selectbox("1. Pilih Format Bank", ["BCA / Mandiri", "BRI", "Panin"])
+uploaded_file = st.file_uploader("2. Upload File PDF Rekening Koran", type="pdf")
+tahun_input = st.text_input("3. Tahun Laporan (Penting untuk BCA/Mandiri)", value="2026")
 
-# --- FUNGSI PEMBANTU ---
-def clean_amount(val):
-    """Membersihkan teks angka agar bisa diproses"""
-    if not val: return "0.00"
-    # Hilangkan karakter non-angka kecuali titik dan koma
-    clean = re.sub(r'[^\d.,]', '', str(val))
-    return clean if clean else "0.00"
+# --- UTILITY: MEMBERSIHKAN ANGKA ---
+def clean_amount_id(val):
+    """Membersihkan format angka Indonesia 1.234.567,89"""
+    if not val or val == "None": return "0,00"
+    s = str(val).strip().replace(' ', '')
+    # Jika angka hanya mengandung digit, titik, dan koma
+    match = re.search(r'(\d{1,3}(?:\.\d{3})*,\d{2})', s)
+    if match: return match.group(1)
+    # Fallback untuk format Inggris 1,234,567.89
+    match_en = re.search(r'(\d{1,3}(?:,\d{3})*\.\d{2})', s)
+    if match_en: return match_en.group(1).replace(',', 'X').replace('.', ',').replace('X', '.')
+    return s if s else "0,00"
 
 # --- PARSER 1: BCA / MANDIRI ---
 def parse_bca_mandiri(file_obj, tahun):
     transactions = []
     current_trx = None
     date_pattern = re.compile(r'^(\d{2}/\d{2})\s')
+    # Mencari nominal format Inggris (BCA/Mandiri biasanya pakai . untuk desimal)
     money_pattern = re.compile(r'(\d{1,3}(?:,\d{3})*\.\d{2})')
     
     with pdfplumber.open(file_obj) as pdf:
@@ -57,30 +63,32 @@ def parse_bri(file_obj):
     transactions = []
     with pdfplumber.open(file_obj) as pdf:
         for page in pdf.pages:
-            table = page.extract_table()
+            # Gunakan pengaturan tabel yang lebih longgar untuk BRI
+            table = page.extract_table(table_settings={
+                "vertical_strategy": "text", 
+                "horizontal_strategy": "text",
+                "snap_tolerance": 3,
+            })
             if not table: continue
             for row in table:
-                # BRI Format: [Tanggal, Uraian, Teller, Debet, Kredit, Saldo]
-                # Filter baris yang mengandung tanggal (dd/mm/yy)
-                if row[0] and re.search(r'\d{2}/\d{2}/\d{2}', str(row[0])):
+                # BRI: [Tgl, Uraian, Teller, Debet, Kredit, Saldo]
+                # Filter baris yang berisi tanggal (01/01/26)
+                if len(row) >= 6 and row[0] and re.search(r'\d{2}/\d{2}/\d{2}', str(row[0])):
                     date_part = str(row[0]).split(' ')[0]
                     d, m, y = date_part.split('/')
                     
-                    deb = clean_amount(row[3])
-                    kre = clean_amount(row[4])
+                    deb = str(row[3]).strip() if row[3] else "0.00"
+                    kre = str(row[4]).strip() if row[4] else "0.00"
                     
-                    # Logika penentuan DB/CR
-                    if deb != "0.00" and deb != "":
-                        jumlah_final = f"{deb} DB"
-                    else:
-                        jumlah_final = f"{kre} CR"
-                    
+                    type_label = "DB" if (deb != "0.00" and deb != "0" and deb != "") else "CR"
+                    nominal = deb if type_label == "DB" else kre
+
                     transactions.append({
                         "Tanggal Transaksi": f"{d}/{m}/20{y}",
                         "Keterangan": str(row[1]).replace('\n', ' '),
                         "Cabang": str(row[2]),
-                        "Jumlah": jumlah_final,
-                        "Saldo": clean_amount(row[5])
+                        "Jumlah": f"{nominal} {type_label}",
+                        "Saldo": str(row[5])
                     })
     return pd.DataFrame(transactions)
 
@@ -88,67 +96,64 @@ def parse_bri(file_obj):
 def parse_panin(file_obj):
     transactions = []
     current_trx = None
-    # Pola Tanggal Panin: 15-Jan-2026 atau 15-Jan
-    date_pattern = re.compile(r'(\d{1,2}-[a-zA-Z]{3}(?:-\d{4})?)')
+    # Pola Tanggal Panin: 15-Jan-2026
+    date_pattern = re.compile(r'(\d{1,2}-[a-zA-Z]{3}-\d{4})')
 
     with pdfplumber.open(file_obj) as pdf:
         for page in pdf.pages:
+            # Panin lebih stabil menggunakan ekstraksi tabel paksa
             table = page.extract_table()
             if not table: continue
             for row in table:
-                # Panin Index: 0:Tgl, 1:Eff, 2:Detail, 3:Debit, 4:Kredit, 5:Saldo
-                tgl = str(row[0]) if row[0] else ""
+                if len(row) < 6: continue
+                tgl = str(row[0])
                 match = date_pattern.search(tgl)
                 
                 if match:
                     if current_trx: transactions.append(current_trx)
                     
-                    deb = clean_amount(row[3])
-                    kre = clean_amount(row[4])
+                    deb = clean_amount_id(row[3])
+                    kre = clean_amount_id(row[4])
                     
-                    if deb != "0.00" and deb != "":
-                        jumlah_final = f"{deb} DB"
-                    else:
-                        jumlah_final = f"{kre} CR"
+                    type_label = "DB" if (deb != "0,00" and deb != "") else "CR"
+                    nominal = deb if type_label == "DB" else kre
                         
                     current_trx = {
                         "Tanggal Transaksi": match.group(1).replace('-', '/'),
                         "Keterangan": str(row[2]).replace('\n', ' '),
                         "Cabang": "0",
-                        "Jumlah": jumlah_final,
-                        "Saldo": clean_amount(row[5])
+                        "Jumlah": f"{nominal} {type_label}",
+                        "Saldo": clean_amount_id(row[5])
                     }
-                elif current_trx and row[2]:
-                    # Gabungkan keterangan jika berlanjut ke baris bawah
+                elif current_trx and row[2] and not re.search(r'Halaman|Saldo|Mata Uang', str(row[2])):
                     current_trx["Keterangan"] += " " + str(row[2]).replace('\n', ' ')
             
             if current_trx: transactions.append(current_trx)
     return pd.DataFrame(transactions).drop_duplicates()
 
-# --- TOMBOL PROSES ---
+# --- EKSEKUSI ---
 if uploaded_file is not None:
     if st.button("🚀 Convert Sekarang"):
-        with st.spinner(f"Menganalisa format {bank_type}..."):
+        with st.spinner(f"Mesin sedang membaca PDF {bank_type}..."):
             try:
-                if bank_type == "BRI":
-                    df = parse_bri(uploaded_file)
-                elif bank_type == "Panin":
-                    df = parse_panin(uploaded_file)
-                else:
-                    df = parse_bca_mandiri(uploaded_file, tahun_input)
+                if bank_type == "BRI": df = parse_bri(uploaded_file)
+                elif bank_type == "Panin": df = parse_panin(uploaded_file)
+                else: df = parse_bca_mandiri(uploaded_file, tahun_input)
                 
                 if not df.empty:
-                    st.success(f"✅ Berhasil! Menemukan {len(df)} transaksi.")
-                    # Reorder kolom sesuai standar output Anda
-                    df = df[['Tanggal Transaksi', 'Keterangan', 'Cabang', 'Jumlah', 'Saldo']]
-                    st.dataframe(df.head(20))
+                    st.success(f"✅ Sukses! Menemukan {len(df)} transaksi.")
+                    df_final = df[['Tanggal Transaksi', 'Keterangan', 'Cabang', 'Jumlah', 'Saldo']]
+                    st.dataframe(df_final)
                     
-                    # Sediakan tombol download
                     buffer = io.BytesIO()
                     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                        df.to_excel(writer, index=False)
+                        df_final.to_excel(writer, index=False)
                     st.download_button("📥 Download Excel", data=buffer.getvalue(), file_name=f"hasil_{bank_type.lower()}.xlsx")
                 else:
-                    st.error("❌ Data tidak ditemukan. Pastikan Anda memilih jenis bank yang benar.")
+                    st.error("❌ Data tidak ditemukan. Cek apakah Anda salah memilih jenis Bank.")
+                    # Debugging untuk user
+                    with st.expander("Lihat Teks Mentah (Hanya untuk pengecekan)"):
+                        with pdfplumber.open(uploaded_file) as pdf:
+                            st.text(pdf.pages[0].extract_text()[:500])
             except Exception as e:
-                st.error(f"Terjadi kesalahan saat membaca file: {e}")
+                st.error(f"Terjadi kesalahan teknis: {e}")
