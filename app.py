@@ -33,25 +33,59 @@ def parse_number(text_val, is_indo_format=True):
     except:
         return 0.0
 
-# --- PARSER BRI ---
+# --- PARSER BRI (DIREVISI TOTAL - TEXT REGEX) ---
 def parse_bri(pdf):
     data = []
+    current_trx = None
+    
+    # Pola: Tanggal (Waktu) Uraian_Transaksi (Teller) Debet Kredit Saldo
+    # Menyesuaikan contoh gambar: 02/01/26 08:00:35 NBMB MASJAN PRIADI ... 8888018 0.00 3,252,375.00 95,053,878.00
+    regex_main = re.compile(r'^(\d{2}/\d{2}/\d{2,4})\s+(?:\d{2}:\d{2}:\d{2}\s+)?(.*)\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})$')
+    
     for page in pdf.pages:
-        table = page.extract_table(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
-        if not table: continue
-        for row in table:
-            if len(row) >= 6 and row[0] and re.search(r'\d{2}/\d{2}/\d{2}', str(row[0])):
-                deb_txt = str(row[3]).strip() if row[3] else ""
-                kre_txt = str(row[4]).strip() if row[4] else ""
-                is_debet = deb_txt not in ["", "0.00", "0", "0.0"]
-                nominal_raw = deb_txt if is_debet else kre_txt
+        text = page.extract_text()
+        if not text: continue
+        
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line: continue
+            
+            match = regex_main.match(line)
+            if match:
+                if current_trx: data.append(current_trx)
                 
-                data.append({
-                    "Tanggal": str(row[0]).split(' ')[0].replace('/01/', '/01/20'), 
-                    "Keterangan": str(row[1]).replace('\n', ' '),
-                    "Nominal": parse_number(nominal_raw, is_indo_format=False),
-                    "Jenis": "DB" if is_debet else "CR"
-                })
+                raw_date = match.group(1)
+                # Standarisasi Tahun ke 4 Digit (01/01/26 -> 01/01/2026)
+                parts = raw_date.split('/')
+                if len(parts) == 3 and len(parts[2]) == 2:
+                    tanggal = f"{parts[0]}/{parts[1]}/20{parts[2]}"
+                else:
+                    tanggal = raw_date
+                
+                desc_raw = match.group(2).strip()
+                deb_txt = match.group(3)
+                kre_txt = match.group(4)
+                
+                deb_val = parse_number(deb_txt, is_indo_format=False)
+                kre_val = parse_number(kre_txt, is_indo_format=False)
+                
+                # Cek mana yang ada isinya
+                is_debet = deb_val > 0
+                nominal = deb_val if is_debet else kre_val
+                jenis = "DB" if is_debet else "CR"
+                
+                current_trx = {
+                    "Tanggal": tanggal,
+                    "Keterangan": desc_raw,
+                    "Nominal": nominal,
+                    "Jenis": jenis
+                }
+            elif current_trx:
+                # Filter agar header tabel di halaman selanjutnya tidak ikut tergabung ke deskripsi
+                if not any(k in line.upper() for k in ["TANGGAL TRANSAKSI", "URAIAN TRANSAKSI", "SALDO", "HALAMAN", "PAGE", "DEBET", "KREDIT"]):
+                    current_trx["Keterangan"] += " " + line
+                    
+    if current_trx: data.append(current_trx)
     return pd.DataFrame(data)
 
 # --- PARSER PANIN ---
@@ -138,7 +172,6 @@ def parse_generic(pdf, year):
                     "Jenis": "DB" if "DB" in line.upper() else "CR"
                 }
             elif current_trx:
-                # PERBAIKAN: Jangan gabungkan baris summary/footer ke deskripsi transaksi terakhir
                 if not any(keyword in line.upper() for keyword in ["SALDO", "MUTASI", "HALAMAN", "PAGE"]):
                     current_trx["Keterangan"] += " " + line.strip()
                     
@@ -170,14 +203,14 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
             
             for index, row in df.iterrows():
                 ket_upper = str(row['Keterangan']).upper()
-                
-                # Cek apakah baris ini BENAR-BENAR sebuah mutasi awal/akhir (bukan tersangkut di deskripsi)
                 is_saldo_summary = any(k in ket_upper for k in kata_kunci_blokir)
                 
                 if not is_saldo_summary:
                     amount = row['Nominal']
+                    
+                    # LOGIKA PUSAT NEGATIF/POSITIF
                     if row['Jenis'] == 'DB':
-                        amount = -abs(amount)
+                        amount = -abs(amount) # Jika Debit, pastikan angkanya Negatif
                     
                     csv_data.append({
                         "*Date": row['Tanggal'],
