@@ -23,23 +23,29 @@ def parse_number(text_val, is_indo_format=True):
     if not text_val: return 0.0
     clean = str(text_val).strip()
     
+    # Deteksi jika angka negatif (Berupa minus di depan atau dikurung kurung)
+    is_negative = False
+    if clean.startswith('-') or (clean.startswith('(') and clean.endswith(')')):
+        is_negative = True
+        
+    # Bersihkan karakter kurung dan minus sebelum dikonversi
+    clean = clean.replace('(', '').replace(')', '').replace('-', '')
+    
     if is_indo_format:
         clean = clean.replace('.', '').replace(',', '.')
     else:
         clean = clean.replace(',', '')
         
     try:
-        return float(clean)
+        val = float(clean)
+        return -val if is_negative else val
     except:
         return 0.0
 
-# --- PARSER BRI (DIREVISI TOTAL - TEXT REGEX) ---
+# --- PARSER BRI ---
 def parse_bri(pdf):
     data = []
     current_trx = None
-    
-    # Pola: Tanggal (Waktu) Uraian_Transaksi (Teller) Debet Kredit Saldo
-    # Menyesuaikan contoh gambar: 02/01/26 08:00:35 NBMB MASJAN PRIADI ... 8888018 0.00 3,252,375.00 95,053,878.00
     regex_main = re.compile(r'^(\d{2}/\d{2}/\d{2,4})\s+(?:\d{2}:\d{2}:\d{2}\s+)?(.*)\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})$')
     
     for page in pdf.pages:
@@ -55,7 +61,6 @@ def parse_bri(pdf):
                 if current_trx: data.append(current_trx)
                 
                 raw_date = match.group(1)
-                # Standarisasi Tahun ke 4 Digit (01/01/26 -> 01/01/2026)
                 parts = raw_date.split('/')
                 if len(parts) == 3 and len(parts[2]) == 2:
                     tanggal = f"{parts[0]}/{parts[1]}/20{parts[2]}"
@@ -69,8 +74,7 @@ def parse_bri(pdf):
                 deb_val = parse_number(deb_txt, is_indo_format=False)
                 kre_val = parse_number(kre_txt, is_indo_format=False)
                 
-                # Cek mana yang ada isinya
-                is_debet = deb_val > 0
+                is_debet = abs(deb_val) > 0
                 nominal = deb_val if is_debet else kre_val
                 jenis = "DB" if is_debet else "CR"
                 
@@ -81,7 +85,6 @@ def parse_bri(pdf):
                     "Jenis": jenis
                 }
             elif current_trx:
-                # Filter agar header tabel di halaman selanjutnya tidak ikut tergabung ke deskripsi
                 if not any(k in line.upper() for k in ["TANGGAL TRANSAKSI", "URAIAN TRANSAKSI", "SALDO", "HALAMAN", "PAGE", "DEBET", "KREDIT"]):
                     current_trx["Keterangan"] += " " + line
                     
@@ -95,12 +98,15 @@ def parse_panin(pdf):
     date_regex = re.compile(r'(\d{1,2}-[a-zA-Z]{3}-\d{4})')
     saldo_terakhir = None
     
+    # Update pola untuk menangkap tanda kurung (1.000,00)
+    panin_money_ptrn = r'\(?\d{1,3}(?:\.\d{3})*,\d{2}\)?'
+    
     for page in pdf.pages:
         text = page.extract_text()
         if not text: continue
         for line in text.split('\n'):
             if "SALDO" in line.upper():
-                amounts = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})', line)
+                amounts = re.findall(panin_money_ptrn, line)
                 if amounts and any(x in line.upper() for x in ["AWAL", "LALU", "PINDAH"]):
                     saldo_terakhir = parse_number(amounts[-1], is_indo_format=True) 
             
@@ -108,7 +114,7 @@ def parse_panin(pdf):
             if match:
                 if current_trx: data.append(current_trx)
                 
-                amounts = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2})', line)
+                amounts = re.findall(panin_money_ptrn, line)
                 if len(amounts) >= 2:
                     nominal_txt, saldo_txt = amounts[0], amounts[-1]
                 elif len(amounts) == 1:
@@ -116,25 +122,27 @@ def parse_panin(pdf):
                 else:
                     nominal_txt, saldo_txt = "0,00", "0,00"
                     
-                nominal_float = parse_number(nominal_txt, is_indo_format=True)
-                saldo_float = parse_number(saldo_txt, is_indo_format=True)
+                # Nominal paksa absolute agar logika math DB/CR berjalan
+                nominal_float = abs(parse_number(nominal_txt, is_indo_format=True))
+                saldo_float = parse_number(saldo_txt, is_indo_format=True) # Biarkan minus jika ada kurung
                 
                 jenis = "CR"
                 if saldo_terakhir is not None:
+                    # Cek Math
                     if abs(saldo_terakhir - nominal_float - saldo_float) < 1.0:
                         jenis = "DB"
                     elif abs(saldo_terakhir + nominal_float - saldo_float) < 1.0:
                         jenis = "CR"
                     else:
-                        if any(k in line.upper() for k in ["RTGS KE", "SETPAJAK", "TARIK", "BIAYA"]):
+                        if any(k in line.upper() for k in ["RTGS KE", "SETPAJAK", "TARIK", "BIAYA", "OD CHG", "ADMIN CHARGE"]):
                             jenis = "DB"
                 else:
-                    if any(k in line.upper() for k in ["RTGS KE", "SETPAJAK", "TARIK", "BIAYA", "TRF KE"]):
+                    if any(k in line.upper() for k in ["RTGS KE", "SETPAJAK", "TARIK", "BIAYA", "TRF KE", "OD CHG", "ADMIN CHARGE"]):
                         jenis = "DB"
                 
                 saldo_terakhir = saldo_float
                 raw_desc = line.replace(match.group(1), "")
-                clean_desc = re.sub(r'\d{1,3}(?:\.\d{3})*,\d{2}', '', raw_desc).strip()
+                clean_desc = re.sub(panin_money_ptrn, '', raw_desc).strip()
                 
                 current_trx = {
                     "Tanggal": match.group(1).replace('-', '/'),
@@ -143,7 +151,7 @@ def parse_panin(pdf):
                     "Jenis": jenis
                 }
             elif current_trx and not any(x in line.upper() for x in ["HALAMAN", "SALDO", "MATA", "TGL. TRANSAKSI"]):
-                clean_line = re.sub(r'\d{1,3}(?:\.\d{3})*,\d{2}', '', line).strip()
+                clean_line = re.sub(panin_money_ptrn, '', line).strip()
                 if clean_line:
                     current_trx["Keterangan"] += " " + clean_line
                 
@@ -194,9 +202,7 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
         pdf.close()
         
         if not df.empty:
-            
-            # --- FILTER SALDO AWAL / AKHIR ---
-            kata_kunci_blokir = ["SALDO AWAL", "SALDO AKHIR", "SALDO LALU"]
+            kata_kunci_blokir = ["SALDO AWAL", "SALDO AKHIR", "SALDO LALU", "RINGKASAN AKUN", "KETERANGAN JUMLAH"]
             
             csv_data = []
             transaksi_valid = 0
@@ -207,10 +213,8 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
                 
                 if not is_saldo_summary:
                     amount = row['Nominal']
-                    
-                    # LOGIKA PUSAT NEGATIF/POSITIF
                     if row['Jenis'] == 'DB':
-                        amount = -abs(amount) # Jika Debit, pastikan angkanya Negatif
+                        amount = -abs(amount)
                     
                     csv_data.append({
                         "*Date": row['Tanggal'],
@@ -225,10 +229,8 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
             df_final = pd.DataFrame(csv_data)
             
             st.success(f"✅ Berhasil! Membaca {len(df)} baris (Tersaring {transaksi_valid} transaksi valid).")
-            
             st.dataframe(df_final.style.format({"*Amount": "{:,.2f}"}))
             
-            # --- DOWNLOAD BUTTON ---
             csv_string = df_final.to_csv(index=False, float_format='%.2f').encode('utf-8')
             
             st.download_button(
