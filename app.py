@@ -61,7 +61,7 @@ def parse_panin(pdf):
     date_regex = re.compile(r'(\d{1,2}-[a-zA-Z]{3}-\d{4})')
     saldo_terakhir = None
     
-    # PERBAIKAN: Fungsi khusus mendeteksi kurung () sebagai angka minus
+    # Fungsi khusus mendeteksi kurung () sebagai angka minus
     def parse_panin_num(txt):
         if not txt: return 0.0
         is_neg = '(' in txt and ')' in txt
@@ -76,13 +76,14 @@ def parse_panin(pdf):
         if not text: continue
         for line in text.split('\n'):
             
-            # PERBAIKAN: Berhenti jika sudah menyentuh footer "Ringkasan Akun"
+            # PERBAIKAN: Simpan transaksi terakhir sebelum menyentuh footer / ringkasan
             if any(x in line.upper() for x in ["RINGKASAN AKUN", "MUTASI DEBIT", "MUTASI KREDIT"]):
-                current_trx = None 
+                if current_trx: 
+                    data.append(current_trx) # Simpan dulu ke data utama
+                    current_trx = None       # Baru bersihkan memori
                 continue 
                 
             if "SALDO" in line.upper():
-                # Regex diupdate untuk menangkap kurung () jika ada
                 amounts = re.findall(r'(\(?\d{1,3}(?:\.\d{3})*,\d{2}\)?)', line)
                 if amounts and any(x in line.upper() for x in ["AWAL", "LALU", "PINDAH"]):
                     saldo_terakhir = parse_panin_num(amounts[-1]) 
@@ -99,19 +100,16 @@ def parse_panin(pdf):
                 else:
                     nominal_txt, saldo_txt = "0,00", "0,00"
                     
-                # Nominal transaksi dijadikan positif mutlak (absolut), hanya saldo yang bisa minus
                 nominal_float = abs(parse_panin_num(nominal_txt))
                 saldo_float = parse_panin_num(saldo_txt)
                 
                 jenis = "CR"
                 if saldo_terakhir is not None:
-                    # Logika matematika kini presisi meskipun saldonya minus
                     if abs(saldo_terakhir - nominal_float - saldo_float) < 1.0:
                         jenis = "DB"
                     elif abs(saldo_terakhir + nominal_float - saldo_float) < 1.0:
                         jenis = "CR"
                     else:
-                        # Pengaman kata kunci (menambahkan CHG, CHARGE, OD CHG)
                         if any(k in line.upper() for k in ["RTGS", "PAJAK", "TARIK", "BIAYA", "CHG", "CHARGE", "OD CHG"]):
                             jenis = "DB"
                 else:
@@ -121,7 +119,6 @@ def parse_panin(pdf):
                 saldo_terakhir = saldo_float
                 
                 raw_desc = line.replace(match.group(1), "")
-                # Membersihkan nominal dari deskripsi (termasuk yang berkurung)
                 clean_desc = re.sub(r'\(?\d{1,3}(?:\.\d{3})*,\d{2}\)?', '', raw_desc).strip()
                 
                 current_trx = {
@@ -131,7 +128,6 @@ def parse_panin(pdf):
                     "Jenis": jenis
                 }
             elif current_trx:
-                # PERBAIKAN: Memastikan header tidak masuk ke deskripsi transaksi
                 if not any(x in line.upper() for x in ["HALAMAN", "SALDO", "MATA", "TGL. TRANSAKSI"]):
                     clean_line = re.sub(r'\(?\d{1,3}(?:\.\d{3})*,\d{2}\)?', '', line).strip()
                     if clean_line:
@@ -139,7 +135,6 @@ def parse_panin(pdf):
                 
     if current_trx: data.append(current_trx)
     return pd.DataFrame(data)
-
 # --- PARSER BCA/MANDIRI ---
 def parse_generic(pdf, year):
     data = []
