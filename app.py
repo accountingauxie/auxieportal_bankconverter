@@ -39,15 +39,14 @@ def extract_payee(desc):
     # 1. Cari entitas bisnis (PT / CV)
     match_pt = re.search(r'\b(PT|CV)\.?\s+([A-Z0-9\s]+)', desc_upper)
     if match_pt:
-        # Ambil 3 kata setelah PT/CV agar tidak terlalu panjang
         return match_pt.group(0).split('  ')[0] 
 
-    # 2. Cari pola transfer "KE" atau "DARI"
-    match_ke = re.search(r'(?:KE|DARI)\s+([A-Z\s]+)', desc_upper)
+    # 2. Cari pola transfer "KE", "DARI", "FROM"
+    match_ke = re.search(r'(?:KE|DARI|FROM)\s+([A-Z0-9\s]+)', desc_upper)
     if match_ke:
-        return match_ke.group(1).strip()
+        # Potong string agar tidak terlalu panjang (nyasar ke nomor referensi)
+        return match_ke.group(1).strip()[:30]
         
-    # 3. Jika tidak ada pola yang dikenali, kosongkan (sesuai request)
     return ""
 
 # --- PARSER BRI ---
@@ -71,30 +70,79 @@ def parse_bri(pdf):
                 })
     return pd.DataFrame(data)
 
-# --- PARSER PANIN ---
+# --- PARSER PANIN (UPDATED DENGAN LOGIKA MATEMATIKA) ---
 def parse_panin(pdf):
     data = []
     current_trx = None
     date_regex = re.compile(r'(\d{1,2}-[a-zA-Z]{3}-\d{4})')
+    saldo_terakhir = None # Simpan saldo running untuk deteksi +/-
     
     for page in pdf.pages:
         text = page.extract_text()
         if not text: continue
         for line in text.split('\n'):
+            
+            # 1. Tangkap Saldo Awal sebagai acuan hitung
+            if "SALDO" in line.upper():
+                amounts = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})', line)
+                if amounts and any(x in line.upper() for x in ["AWAL", "LALU", "PINDAH"]):
+                    saldo_terakhir = parse_number(amounts[-1], is_indo_format=True)
+            
             match = date_regex.search(line)
             if match:
                 if current_trx: data.append(current_trx)
+                
+                # Ekstrak semua angka di baris ini (Biasanya: [Nominal, Saldo])
                 amounts = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})', line)
-                nominal_txt = amounts[0] if len(amounts) > 0 else "0,00"
+                if len(amounts) >= 2:
+                    nominal_txt = amounts[0]
+                    saldo_txt = amounts[-1]
+                elif len(amounts) == 1:
+                    nominal_txt = amounts[0]
+                    saldo_txt = amounts[0]
+                else:
+                    nominal_txt, saldo_txt = "0,00", "0,00"
+                    
+                nominal_float = parse_number(nominal_txt, is_indo_format=True)
+                saldo_float = parse_number(saldo_txt, is_indo_format=True)
+                
+                jenis = "CR" # Default uang masuk
+                
+                # --- LOGIKA MATEMATIKA AKUNTANSI ---
+                if saldo_terakhir is not None:
+                    # Cek Debit: Saldo Lama - Uang Keluar = Saldo Baru
+                    if abs(saldo_terakhir - nominal_float - saldo_float) < 1.0:
+                        jenis = "DB"
+                    # Cek Kredit: Saldo Lama + Uang Masuk = Saldo Baru
+                    elif abs(saldo_terakhir + nominal_float - saldo_float) < 1.0:
+                        jenis = "CR"
+                    else:
+                        # Fallback jika hitungan meleset (misal halaman ganjil)
+                        if any(k in line.upper() for k in ["RTGS KE", "SETPAJAK", "TARIK", "BIAYA"]):
+                            jenis = "DB"
+                else:
+                    # Fallback jika Saldo Awal tidak terdeteksi
+                    if any(k in line.upper() for k in ["RTGS KE", "SETPAJAK", "TARIK", "BIAYA", "TRF KE"]):
+                        jenis = "DB"
+                
+                # Update saldo terakhir untuk baris berikutnya
+                saldo_terakhir = saldo_float
+                
+                # Bersihkan deskripsi dari angka nominal & saldo agar rapi
+                raw_desc = line.replace(match.group(1), "")
+                clean_desc = re.sub(r'\d{1,3}(?:\.\d{3})*,\d{2}', '', raw_desc).strip()
                 
                 current_trx = {
                     "Tanggal": match.group(1).replace('-', '/'),
-                    "Keterangan": line.replace(match.group(1), "").strip(),
-                    "Nominal": parse_number(nominal_txt, is_indo_format=True),
-                    "Jenis": "CR" # Default CR, user harus cek manual jika ada Debit
+                    "Keterangan": clean_desc,
+                    "Nominal": nominal_float,
+                    "Jenis": jenis
                 }
-            elif current_trx and not any(x in line for x in ["Halaman", "Saldo", "Mata"]):
-                current_trx["Keterangan"] += " " + line.strip()
+            elif current_trx and not any(x in line for x in ["Halaman", "Saldo", "Mata", "Tgl. Transaksi"]):
+                # Bersihkan juga baris sambungan deskripsi dari angka acak
+                clean_line = re.sub(r'\d{1,3}(?:\.\d{3})*,\d{2}', '', line).strip()
+                if clean_line:
+                    current_trx["Keterangan"] += " " + clean_line
                 
     if current_trx: data.append(current_trx)
     return pd.DataFrame(data)
@@ -145,10 +193,11 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
             # --- KONVERSI KE FORMAT CSV TARGET ---
             csv_data = []
             for index, row in df.iterrows():
-                # 1. Logika Tanda Negatif/Positif
+                
+                # 1. Logika Uang Keluar (DB) = Negatif
                 amount = row['Nominal']
                 if row['Jenis'] == 'DB':
-                    amount = -amount # Ubah jadi negatif
+                    amount = -abs(amount) # Paksa jadi negatif jika DB
                 
                 # 2. Logika Payee (Coba deteksi)
                 detected_payee = extract_payee(row['Keterangan'])
@@ -158,8 +207,8 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
                     "*Amount": amount,
                     "Payee": detected_payee,
                     "Description": row['Keterangan'],
-                    "Reference": "",     # Kosong sesuai template
-                    "Check Number": ""   # Kosong sesuai template
+                    "Reference": "",     
+                    "Check Number": ""   
                 })
             
             df_final = pd.DataFrame(csv_data)
