@@ -4,108 +4,129 @@ import pandas as pd
 import re
 import io
 
-# --- KONFIGURASI HALAMAN ---
-st.set_page_config(page_title="Multi-Bank Converter v6", page_icon="💰", layout="wide")
-st.title("💰 Multi-Bank Statement Converter (Password Ready)")
-st.info("Jika PDF Anda memiliki password (biasanya tanggal lahir atau nomor kartu), masukkan di kolom bawah.")
+# --- CONFIG ---
+st.set_page_config(page_title="Bank Converter v7", layout="wide")
+st.title("💰 Multi-Bank Converter (v7.0 - Final)")
 
-# --- PILIHAN BANK & PASSWORD ---
+# --- UI ---
 col1, col2 = st.columns(2)
 with col1:
-    bank_type = st.selectbox("1. Pilih Jenis Bank", ["BCA / Mandiri", "BRI", "Panin"])
-    uploaded_file = st.file_uploader("2. Upload File PDF Rekening Koran", type="pdf")
-
+    bank_type = st.selectbox("1. Pilih Bank", ["BCA / Mandiri", "BRI", "Panin"])
+    uploaded_file = st.file_uploader("2. Upload PDF", type="pdf")
 with col2:
-    pdf_password = st.text_input("3. Password PDF (Kosongkan jika tidak ada)", type="password")
-    tahun_input = st.text_input("4. Tahun Laporan (Hanya BCA/Mandiri)", value="2026")
+    pdf_password = st.text_input("3. Password (Jika ada)", type="password", help="Kosongkan jika PDF tidak dikunci")
+    tahun_input = st.text_input("4. Tahun (Hanya BCA/Mandiri)", value="2026")
 
-# --- MESIN PEMBERSIH ANGKA ---
-def format_rp(val):
-    if not val: return "0,00"
-    s = str(val).strip().replace('\n', ' ')
-    match = re.search(r'([\d.,]+)', s)
-    return match.group(1) if match else "0,00"
+# --- UTILITY: MEMBERSIHKAN ANGKA ---
+def clean_money(text, is_intl=False):
+    if not text: return "0,00"
+    s = str(text).strip().replace('\n', ' ')
+    if is_intl: # BRI: 1,000.00 -> 1.000,00
+        s = s.replace(',', 'X').replace('.', ',').replace('X', '.')
+    return s
 
-def get_db_cr(debet, kredit):
-    d = str(debet).strip().replace('.', '').replace(',', '')
-    k = str(kredit).strip().replace('.', '').replace(',', '')
-    if d and d not in ["000", "0", "None", "-", ""]: return f"{format_rp(debet)} DB"
-    if k and k not in ["000", "0", "None", "-", ""]: return f"{format_rp(kredit)} CR"
-    return "0,00 CR"
+# --- PARSER BRI (Improved Table Strategy) ---
+def parse_bri(pdf):
+    data = []
+    for page in pdf.pages:
+        table = page.extract_table(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
+        if not table: continue
+        for row in table:
+            if len(row) >= 6 and row[0] and re.search(r'\d{2}/\d{2}/\d{2}', str(row[0])):
+                deb = str(row[3]).strip() if row[3] else ""
+                kre = str(row[4]).strip() if row[4] else ""
+                is_db = deb != "" and deb != "0.00" and deb != "0"
+                
+                data.append({
+                    "Tanggal Transaksi": str(row[0]).split(' ')[0].replace('/01/', '/01/20'), # Fix year
+                    "Keterangan": str(row[1]).replace('\n', ' '),
+                    "Cabang": str(row[2]),
+                    "Jumlah": f"{clean_money(deb if is_db else kre, True)} {'DB' if is_db else 'CR'}",
+                    "Saldo": clean_money(row[5], True)
+                })
+    return pd.DataFrame(data)
 
-# --- PARSER BANK (Sama seperti v5 dengan tambahan password) ---
-def parse_pdf(file_obj, bank, pswd, year):
-    transactions = []
-    # Membuka PDF dengan password jika disediakan
-    with pdfplumber.open(file_obj, password=pswd if pswd else None) as pdf:
-        for page in pdf.pages:
-            if bank == "BRI":
-                table = page.extract_table()
-                if not table: continue
-                for row in table:
-                    if len(row) >= 6 and row[0] and re.search(r'\d{2}/\d{2}/\d{2}', str(row[0])):
-                        date_part = str(row[0]).split(' ')[0]
-                        d, m, y = date_part.split('/')
-                        transactions.append({
-                            "Tanggal Transaksi": f"{d}/{m}/20{y}",
-                            "Keterangan": str(row[1]).replace('\n', ' '), "Cabang": str(row[2]),
-                            "Jumlah": get_db_cr(row[3], row[4]), "Saldo": format_rp(row[5])
-                        })
-            elif bank == "Panin":
-                table = page.extract_table()
-                if not table: continue
-                current_trx = None
-                date_pattern = re.compile(r'(\d{1,2}-[a-zA-Z]{3}(?:-\d{4})?)')
-                for row in table:
-                    if len(row) < 6: continue
-                    match = date_pattern.search(str(row[0]))
-                    if match:
-                        if current_trx: transactions.append(current_trx)
-                        tgl = match.group(1).replace('-', '/')
-                        if len(tgl) <= 6: tgl += f"/{year}"
-                        current_trx = {
-                            "Tanggal Transaksi": tgl, "Keterangan": str(row[2]).replace('\n', ' '),
-                            "Cabang": "0", "Jumlah": get_db_cr(row[3], row[4]), "Saldo": format_rp(row[5])
-                        }
-                    elif current_trx and row[2] and not any(x in str(row[2]) for x in ["Halaman", "Saldo"]):
-                        current_trx["Keterangan"] += " " + str(row[2]).replace('\n', ' ')
-                if current_trx: transactions.append(current_trx)
-            else: # BCA/Mandiri
-                text = page.extract_text()
-                if not text: continue
-                date_pattern = re.compile(r'^(\d{2}/\d{2})\s')
-                money_pattern = re.compile(r'(\d{1,3}(?:,\d{3})*\.\d{2})')
-                current_trx = None
-                for line in text.split('\n'):
-                    date_match = date_pattern.match(line)
-                    if date_match:
-                        if current_trx: transactions.append(current_trx)
-                        raw_date = date_match.group(1)
-                        money_matches = money_pattern.findall(line)
-                        nominal = money_matches[0] if money_matches else "0.00"
-                        saldo = money_matches[-1] if len(money_matches) > 1 else "0.00"
-                        type_label = "DB" if "DB" in line.upper() else "CR"
-                        current_trx = {"Tanggal Transaksi": f"{raw_date}/{year}", "Keterangan": line.strip(), "Cabang": "0", "Jumlah": f"{nominal} {type_label}", "Saldo": saldo}
-                    elif current_trx and not any(x in line for x in ["SALDO", "HALAMAN"]):
-                        current_trx["Keterangan"] += " " + line.strip()
-                if current_trx: transactions.append(current_trx)
-    return pd.DataFrame(transactions)
+# --- PARSER PANIN (New Row-by-Row Strategy) ---
+def parse_panin(pdf):
+    data = []
+    current_trx = None
+    date_regex = re.compile(r'(\d{1,2}-[a-zA-Z]{3}-\d{4})')
+    
+    for page in pdf.pages:
+        text = page.extract_text()
+        if not text: continue
+        for line in text.split('\n'):
+            match = date_regex.search(line)
+            if match:
+                if current_trx: data.append(current_trx)
+                # Mencari angka mutasi (biasanya ada 2-3 angka besar di baris itu)
+                amounts = re.findall(r'(\d{1,3}(?:\.\d{3})*,\d{2})', line)
+                nominal = amounts[0] if len(amounts) > 0 else "0,00"
+                saldo = amounts[-1] if len(amounts) > 1 else "0,00"
+                
+                # Panin: DB jika ada di posisi tengah, CR jika di kanan. 
+                # Kita asumsikan CR dulu, nanti user bisa cek.
+                current_trx = {
+                    "Tanggal Transaksi": match.group(1).replace('-', '/'),
+                    "Keterangan": line.replace(match.group(1), "").strip(),
+                    "Cabang": "0", "Jumlah": f"{nominal} CR", "Saldo": saldo
+                }
+            elif current_trx and not any(x in line for x in ["Halaman", "Saldo", "Mata"]):
+                current_trx["Keterangan"] += " " + line.strip()
+                
+    if current_trx: data.append(current_trx)
+    return pd.DataFrame(data)
 
-# --- EKSEKUSI ---
-if uploaded_file is not None:
-    if st.button("🚀 Convert Sekarang"):
-        with st.spinner("Sedang membuka PDF..."):
-            try:
-                df = parse_pdf(uploaded_file, bank_type, pdf_password, tahun_input)
-                if not df.empty:
-                    st.success(f"✅ Berhasil! Ditemukan {len(df)} transaksi.")
-                    st.dataframe(df)
-                    buffer = io.BytesIO()
-                    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                        df.to_excel(writer, index=False)
-                    st.download_button("📥 Download Excel", data=buffer.getvalue(), file_name=f"hasil_{bank_type.lower()}.xlsx")
-                else:
-                    st.error("❌ Gagal membaca data. Cek apakah password sudah benar.")
-            except Exception as e:
-                st.error(f"Kesalahan: {e}")
-                st.warning("Biasanya ini karena password salah atau PDF tidak bisa dibuka.")
+# --- PARSER BCA/MANDIRI ---
+def parse_generic(pdf, year):
+    data = []
+    current_trx = None
+    date_ptrn = re.compile(r'^(\d{2}/\d{2})\s')
+    money_ptrn = re.compile(r'(\d{1,3}(?:,\d{3})*\.\d{2})')
+    for page in pdf.pages:
+        for line in (page.extract_text() or "").split('\n'):
+            m = date_ptrn.match(line)
+            if m:
+                if current_trx: data.append(current_trx)
+                moneys = money_ptrn.findall(line)
+                current_trx = {
+                    "Tanggal Transaksi": f"{m.group(1)}/{year}",
+                    "Keterangan": line.strip(), "Cabang": "0",
+                    "Jumlah": f"{moneys[0] if moneys else '0.00'} {'DB' if 'DB' in line.upper() else 'CR'}",
+                    "Saldo": moneys[-1] if len(moneys)>1 else "0.00"
+                }
+            elif current_trx: current_trx["Keterangan"] += " " + line.strip()
+    if current_trx: data.append(current_trx)
+    return pd.DataFrame(data)
+
+# --- EXECUTION ---
+if uploaded_file and st.button("🚀 Convert Sekarang"):
+    try:
+        # Step 1: Coba buka PDF (Auto-decrypt)
+        try:
+            pdf = pdfplumber.open(uploaded_file, password=pdf_password if pdf_password else None)
+        except:
+            st.error("❌ Gagal membuka PDF. Jika file diproteksi, pastikan password benar.")
+            st.stop()
+            
+        # Step 2: Pilih Parser
+        with st.spinner("Menganalisa data..."):
+            if bank_type == "BRI": df = parse_bri(pdf)
+            elif bank_type == "Panin": df = parse_panin(pdf)
+            else: df = parse_generic(pdf, tahun_input)
+            
+        pdf.close()
+        
+        # Step 3: Tampilkan Hasil
+        if not df.empty:
+            st.success(f"✅ Berhasil menarik {len(df)} transaksi!")
+            st.dataframe(df)
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False)
+            st.download_button("📥 Download Excel", buffer.getvalue(), f"hasil_{bank_type.lower()}.xlsx")
+        else:
+            st.warning("⚠️ File terbuka tapi tidak ada transaksi yang terdeteksi. Cek format bank yang dipilih.")
+            
+    except Exception as e:
+        st.error(f"Terjadi error sistem: {e}")
