@@ -35,19 +35,6 @@ def parse_number(text_val, is_indo_format=True):
     except:
         return 0.0
 
-# --- UTILITY: DETEKSI PAYEE (Otomatis) ---
-def extract_payee(desc):
-    desc_upper = str(desc).upper()
-    match_pt = re.search(r'\b(PT|CV)\.?\s+([A-Z0-9\s]+)', desc_upper)
-    if match_pt:
-        return match_pt.group(0).split('  ')[0] 
-
-    match_ke = re.search(r'(?:KE|DARI|FROM)\s+([A-Z0-9\s]+)', desc_upper)
-    if match_ke:
-        return match_ke.group(1).strip()[:30]
-        
-    return ""
-
 # --- PARSER BRI (Format International) ---
 def parse_bri(pdf):
     data = []
@@ -151,7 +138,7 @@ def parse_generic(pdf, year):
                 current_trx = {
                     "Tanggal": f"{m.group(1)}/{year}",
                     "Keterangan": line.strip(), 
-                    "Nominal": parse_number(nominal_txt, is_indo_format=False), # False = Intl (PERBAIKAN DISINI)
+                    "Nominal": parse_number(nominal_txt, is_indo_format=False), # False = Intl
                     "Jenis": "DB" if "DB" in line.upper() else "CR"
                 }
             elif current_trx: current_trx["Keterangan"] += " " + line.strip()
@@ -182,12 +169,10 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
                 if row['Jenis'] == 'DB':
                     amount = -abs(amount)
                 
-                detected_payee = extract_payee(row['Keterangan'])
-                
                 csv_data.append({
                     "*Date": row['Tanggal'],
                     "*Amount": amount,  # Angka asli (Float), paling aman untuk import CSV ke sistem akunting
-                    "Payee": detected_payee,
+                    "Payee": "",        # <--- DIKOSONGKAN SESUAI REQUEST
                     "Description": row['Keterangan'],
                     "Reference": "",     
                     "Check Number": ""   
