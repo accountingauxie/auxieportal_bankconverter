@@ -233,10 +233,14 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
             
             csv_string = df_final.to_csv(index=False, float_format='%.2f').encode('utf-8')
             
+            # AMBIL NAMA FILE ASLI DAN GANTI EXTENSION JADI .CSV
+            nama_file_asli = uploaded_file.name
+            nama_file_csv = nama_file_asli.rsplit('.', 1)[0] + '.csv'
+            
             st.download_button(
                 label="📥 Download CSV",
                 data=csv_string,
-                file_name=f"import_{bank_type.lower()}.csv",
+                file_name=nama_file_csv, # <--- SEKARANG PAKAI NAMA ASLI
                 mime="text/csv"
             )
         else:
