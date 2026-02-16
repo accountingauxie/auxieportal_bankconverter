@@ -2,8 +2,7 @@ import streamlit as st
 import pdfplumber
 import pandas as pd
 import re
-import io
-import os # Tambahan modul untuk mengambil nama file asli
+import os
 
 # --- CONFIG ---
 st.set_page_config(page_title="Accounting CSV Converter", layout="wide")
@@ -17,16 +16,21 @@ with col1:
     uploaded_file = st.file_uploader("2. Upload PDF", type="pdf")
 with col2:
     pdf_password = st.text_input("3. Password (Jika ada)", type="password")
-    tahun_input = st.text_input("4. Tahun (Hanya BCA/Mandiri)", value="2026")
+    tahun_input = st.text_input("4. Tahun (Khusus BCA/Mandiri)", value="2026")
 
 # --- UTILITY: KONVERSI KE ANGKA MURNI ---
 def parse_number(text_val, is_indo_format=True):
     if not text_val: return 0.0
     clean = str(text_val).strip()
     
+    # Hapus simbol mata uang jika ada
+    clean = clean.replace('IDR', '').replace('Rp', '').strip()
+
     if is_indo_format:
+        # Format: 10.000,00 (Titik = Ribuan, Koma = Desimal)
         clean = clean.replace('.', '').replace(',', '.')
     else:
+        # Format: 10,000.00 (Koma = Ribuan, Titik = Desimal) -> Format BRI di Gambar
         clean = clean.replace(',', '')
         
     try:
@@ -34,25 +38,81 @@ def parse_number(text_val, is_indo_format=True):
     except:
         return 0.0
 
-# --- PARSER BRI ---
+# --- PARSER BRI (PERBAIKAN LOGIC) ---
 def parse_bri(pdf):
     data = []
+    # Loop setiap halaman
     for page in pdf.pages:
-        table = page.extract_table(table_settings={"vertical_strategy": "text", "horizontal_strategy": "text"})
+        # Gunakan settings default agar lebih toleran, jangan paksa 'vertical_strategy': 'text' 
+        # karena deskripsi panjang yang punya spasi bisa dianggap kolom baru.
+        table = page.extract_table() 
+        
         if not table: continue
+        
         for row in table:
-            if len(row) >= 6 and row[0] and re.search(r'\d{2}/\d{2}/\d{2}', str(row[0])):
-                deb_txt = str(row[3]).strip() if row[3] else ""
-                kre_txt = str(row[4]).strip() if row[4] else ""
-                is_debet = deb_txt not in ["", "0.00", "0", "0.0"]
-                nominal_raw = deb_txt if is_debet else kre_txt
-                
-                data.append({
-                    "Tanggal": str(row[0]).split(' ')[0].replace('/01/', '/01/20'), 
-                    "Keterangan": str(row[1]).replace('\n', ' '),
-                    "Nominal": parse_number(nominal_raw, is_indo_format=False),
-                    "Jenis": "DB" if is_debet else "CR"
-                })
+            # Bersihkan row dari NoneType
+            row = [str(x).strip() if x else "" for x in row]
+            
+            # Struktur BRI biasanya: [Tanggal, Uraian, ..., Teller, Debet, Kredit, Saldo]
+            # Karena Uraian bisa terpecah jadi banyak kolom, kita ambil angka dari BELAKANG.
+            # Minimal harus ada 6 kolom logika dasarnya.
+            if len(row) < 5: continue
+            
+            # Validasi Kolom Pertama adalah Tanggal (dd/mm/yy)
+            if not re.search(r'\d{2}/\d{2}/\d{2}', row[0]):
+                continue
+
+            # --- 1. AMBIL TANGGAL ---
+            # Format di PDF: 01/01/26 13:15:37
+            tgl_raw = row[0].split(' ')[0] # Ambil 01/01/26
+            parts = tgl_raw.split('/')
+            if len(parts) == 3:
+                # Ubah tahun 2 digit (26) jadi 4 digit (2026)
+                if len(parts[2]) == 2:
+                    parts[2] = "20" + parts[2]
+                tgl_fix = "/".join(parts)
+            else:
+                tgl_fix = tgl_raw
+
+            # --- 2. AMBIL ANGKA (STRATEGI DARI BELAKANG) ---
+            # Row terakhir (-1) = Saldo
+            # Row kedua akhir (-2) = Kredit (Uang Masuk)
+            # Row ketiga akhir (-3) = Debet (Uang Keluar)
+            # Row keempat akhir (-4) = Teller ID (Biasanya)
+            
+            kredit_txt = row[-2]
+            debet_txt = row[-3]
+            
+            # Parse angka (BRI pakai Koma sebagai pemisah ribuan, Titik sebagai desimal)
+            kredit_val = parse_number(kredit_txt, is_indo_format=False)
+            debet_val = parse_number(debet_txt, is_indo_format=False)
+            
+            nominal = 0.0
+            jenis = "CR" # Default Credit
+
+            if debet_val > 0:
+                nominal = debet_val
+                jenis = "DB" # Debit
+            else:
+                nominal = kredit_val
+                jenis = "CR" # Credit
+
+            # --- 3. AMBIL DESKRIPSI ---
+            # Gabungkan semua kolom di antara Tanggal (index 0) dan Teller (index -4)
+            # Ini menangani kasus jika deskripsi terpecah menjadi banyak kolom
+            desc_cols = row[1:-4] 
+            deskripsi = " ".join(desc_cols).replace('\n', ' ').strip()
+            
+            # Bersihkan jika ada sisa nomor referensi yang menempel tidak rapi
+            deskripsi = re.sub(r'\s+', ' ', deskripsi)
+
+            data.append({
+                "Tanggal": tgl_fix,
+                "Keterangan": deskripsi,
+                "Nominal": nominal,
+                "Jenis": jenis
+            })
+            
     return pd.DataFrame(data)
 
 # --- PARSER PANIN ---
@@ -62,7 +122,6 @@ def parse_panin(pdf):
     date_regex = re.compile(r'(\d{1,2}-[a-zA-Z]{3}-\d{4})')
     saldo_terakhir = None
     
-    # Fungsi khusus mendeteksi kurung () sebagai angka minus
     def parse_panin_num(txt):
         if not txt: return 0.0
         is_neg = '(' in txt and ')' in txt
@@ -76,12 +135,10 @@ def parse_panin(pdf):
         text = page.extract_text()
         if not text: continue
         for line in text.split('\n'):
-            
-            # PERBAIKAN: Simpan transaksi terakhir sebelum menyentuh footer / ringkasan
             if any(x in line.upper() for x in ["RINGKASAN AKUN", "MUTASI DEBIT", "MUTASI KREDIT"]):
                 if current_trx: 
-                    data.append(current_trx) # Simpan dulu ke data utama
-                    current_trx = None       # Baru bersihkan memori
+                    data.append(current_trx)
+                    current_trx = None
                 continue 
                 
             if "SALDO" in line.upper():
@@ -183,7 +240,7 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
         if not df.empty:
             
             # --- FILTER SALDO AWAL / AKHIR & SALDO 0 ---
-            kata_kunci_blokir = ["SALDO AWAL", "SALDO AKHIR", "SALDO LALU"]
+            kata_kunci_blokir = ["SALDO AWAL", "SALDO AKHIR", "SALDO LALU", "BEGINNING BALANCE"]
             
             csv_data = []
             transaksi_valid = 0
@@ -192,12 +249,19 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
                 ket_upper = str(row['Keterangan']).upper()
                 
                 is_saldo_summary = any(k in ket_upper for k in kata_kunci_blokir)
-                is_nominal_valid = float(row['Nominal']) > 0
+                # Pastikan nominal valid (bukan 0 atau error)
+                try:
+                    is_nominal_valid = float(row['Nominal']) > 0
+                except:
+                    is_nominal_valid = False
                 
                 if not is_saldo_summary and is_nominal_valid:
                     amount = row['Nominal']
+                    # LOGIKA CSV: Debit = Negatif, Kredit = Positif
                     if row['Jenis'] == 'DB':
                         amount = -abs(amount)
+                    else:
+                        amount = abs(amount)
                     
                     csv_data.append({
                         "*Date": row['Tanggal'],
@@ -218,7 +282,6 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
             # --- DOWNLOAD BUTTON ---
             csv_string = df_final.to_csv(index=False, float_format='%.2f').encode('utf-8')
             
-            # Ambil nama file asli (tanpa .pdf) dan tambahkan .csv
             original_filename, _ = os.path.splitext(uploaded_file.name)
             output_filename = f"{original_filename}.csv"
             
@@ -229,7 +292,7 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
                 mime="text/csv"
             )
         else:
-            st.warning("⚠️ Data kosong. Cek pilihan Bank.")
+            st.warning("⚠️ Data kosong. Cek pilihan Bank atau password PDF.")
             
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Error System: {e}")
