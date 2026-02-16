@@ -22,15 +22,14 @@ with col2:
 def parse_number(text_val, is_indo_format=True):
     if not text_val: return 0.0
     clean = str(text_val).strip()
-    
-    # Hapus simbol mata uang jika ada
+    # Bersihkan simbol mata uang
     clean = clean.replace('IDR', '').replace('Rp', '').strip()
 
     if is_indo_format:
-        # Format: 10.000,00 (Titik = Ribuan, Koma = Desimal)
+        # Format Indo: 10.000,00 -> Hapus titik, ganti koma jadi titik
         clean = clean.replace('.', '').replace(',', '.')
     else:
-        # Format: 10,000.00 (Koma = Ribuan, Titik = Desimal) -> Format BRI di Gambar
+        # Format US (BRI): 10,000.00 -> Hapus koma
         clean = clean.replace(',', '')
         
     try:
@@ -38,81 +37,78 @@ def parse_number(text_val, is_indo_format=True):
     except:
         return 0.0
 
-# --- PARSER BRI (PERBAIKAN LOGIC) ---
+# --- PARSER BRI (METODE TEXT - LEBIH STABIL) ---
 def parse_bri(pdf):
     data = []
-    # Loop setiap halaman
+    # Regex mendeteksi tanggal di awal baris: 01/01/26
+    date_start_pattern = re.compile(r'^(\d{2}/\d{2}/\d{2,4})')
+    
     for page in pdf.pages:
-        # Gunakan settings default agar lebih toleran, jangan paksa 'vertical_strategy': 'text' 
-        # karena deskripsi panjang yang punya spasi bisa dianggap kolom baru.
-        table = page.extract_table() 
+        # Ambil teks mentah, menjaga tata letak visual
+        text = page.extract_text(layout=True)
+        if not text: continue
         
-        if not table: continue
-        
-        for row in table:
-            # Bersihkan row dari NoneType
-            row = [str(x).strip() if x else "" for x in row]
-            
-            # Struktur BRI biasanya: [Tanggal, Uraian, ..., Teller, Debet, Kredit, Saldo]
-            # Karena Uraian bisa terpecah jadi banyak kolom, kita ambil angka dari BELAKANG.
-            # Minimal harus ada 6 kolom logika dasarnya.
-            if len(row) < 5: continue
-            
-            # Validasi Kolom Pertama adalah Tanggal (dd/mm/yy)
-            if not re.search(r'\d{2}/\d{2}/\d{2}', row[0]):
-                continue
+        lines = text.split('\n')
+        for line in lines:
+            line = line.strip()
+            # 1. Cek apakah baris diawali tanggal valid
+            date_match = date_start_pattern.search(line)
+            if date_match:
+                raw_date = date_match.group(1)
+                
+                # 2. Cari angka format uang di baris ini
+                # Regex ini mencari pola angka seperti: 26,250.00 atau 0.00
+                # Mendukung format 1,000.00 (BRI)
+                money_matches = re.findall(r'(\d{1,3}(?:,\d{3})*\.\d{2})', line)
+                
+                # Logika BRI: Baris transaksi pasti punya minimal 3 kolom angka di akhir
+                # Urutan dari belakang: [Saldo, Kredit, Debet]
+                if len(money_matches) >= 3:
+                    saldo_txt = money_matches[-1]
+                    kredit_txt = money_matches[-2]
+                    debet_txt = money_matches[-3]
+                    
+                    # Parse angka (BRI pakai format US: Koma=Ribuan, Titik=Desimal)
+                    debet_val = parse_number(debet_txt, is_indo_format=False)
+                    kredit_val = parse_number(kredit_txt, is_indo_format=False)
+                    
+                    nominal = 0.0
+                    jenis = "CR"
 
-            # --- 1. AMBIL TANGGAL ---
-            # Format di PDF: 01/01/26 13:15:37
-            tgl_raw = row[0].split(' ')[0] # Ambil 01/01/26
-            parts = tgl_raw.split('/')
-            if len(parts) == 3:
-                # Ubah tahun 2 digit (26) jadi 4 digit (2026)
-                if len(parts[2]) == 2:
-                    parts[2] = "20" + parts[2]
-                tgl_fix = "/".join(parts)
-            else:
-                tgl_fix = tgl_raw
+                    if debet_val > 0:
+                        nominal = debet_val
+                        jenis = "DB"
+                    else:
+                        nominal = kredit_val
+                        jenis = "CR"
 
-            # --- 2. AMBIL ANGKA (STRATEGI DARI BELAKANG) ---
-            # Row terakhir (-1) = Saldo
-            # Row kedua akhir (-2) = Kredit (Uang Masuk)
-            # Row ketiga akhir (-3) = Debet (Uang Keluar)
-            # Row keempat akhir (-4) = Teller ID (Biasanya)
-            
-            kredit_txt = row[-2]
-            debet_txt = row[-3]
-            
-            # Parse angka (BRI pakai Koma sebagai pemisah ribuan, Titik sebagai desimal)
-            kredit_val = parse_number(kredit_txt, is_indo_format=False)
-            debet_val = parse_number(debet_txt, is_indo_format=False)
-            
-            nominal = 0.0
-            jenis = "CR" # Default Credit
+                    # 3. Ambil Deskripsi
+                    # Caranya: Hapus Tanggal dari depan, Hapus Angka dari belakang
+                    # Sisa teks di tengah adalah Deskripsi + Teller ID
+                    
+                    # Hapus tanggal
+                    temp_line = line.replace(raw_date, "", 1)
+                    
+                    # Hapus angka-angka transaksi dari string (ambil 3 angka terakhir yg ditemukan)
+                    for m in [debet_txt, kredit_txt, saldo_txt]:
+                        # replace dari kanan (reverse) agar aman jika ada angka sama di deskripsi
+                        temp_line = temp_line.rsplit(m, 1)[0]
+                    
+                    clean_desc = temp_line.strip()
+                    
+                    # 4. Fix Tahun Tanggal (26 -> 2026)
+                    parts = raw_date.split('/')
+                    if len(parts) == 3 and len(parts[2]) == 2:
+                        parts[2] = "20" + parts[2]
+                    final_date = "/".join(parts)
 
-            if debet_val > 0:
-                nominal = debet_val
-                jenis = "DB" # Debit
-            else:
-                nominal = kredit_val
-                jenis = "CR" # Credit
+                    data.append({
+                        "Tanggal": final_date,
+                        "Keterangan": clean_desc,
+                        "Nominal": nominal,
+                        "Jenis": jenis
+                    })
 
-            # --- 3. AMBIL DESKRIPSI ---
-            # Gabungkan semua kolom di antara Tanggal (index 0) dan Teller (index -4)
-            # Ini menangani kasus jika deskripsi terpecah menjadi banyak kolom
-            desc_cols = row[1:-4] 
-            deskripsi = " ".join(desc_cols).replace('\n', ' ').strip()
-            
-            # Bersihkan jika ada sisa nomor referensi yang menempel tidak rapi
-            deskripsi = re.sub(r'\s+', ' ', deskripsi)
-
-            data.append({
-                "Tanggal": tgl_fix,
-                "Keterangan": deskripsi,
-                "Nominal": nominal,
-                "Jenis": jenis
-            })
-            
     return pd.DataFrame(data)
 
 # --- PARSER PANIN ---
@@ -249,7 +245,6 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
                 ket_upper = str(row['Keterangan']).upper()
                 
                 is_saldo_summary = any(k in ket_upper for k in kata_kunci_blokir)
-                # Pastikan nominal valid (bukan 0 atau error)
                 try:
                     is_nominal_valid = float(row['Nominal']) > 0
                 except:
@@ -292,7 +287,7 @@ if uploaded_file and st.button("🚀 Convert ke CSV"):
                 mime="text/csv"
             )
         else:
-            st.warning("⚠️ Data kosong. Cek pilihan Bank atau password PDF.")
+            st.warning("⚠️ Data kosong. Format PDF BRI ini mungkin tidak memiliki garis tabel. Coba lagi.")
             
     except Exception as e:
         st.error(f"Error System: {e}")
