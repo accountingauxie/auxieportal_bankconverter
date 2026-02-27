@@ -37,78 +37,95 @@ def parse_number(text_val, is_indo_format=True):
     except:
         return 0.0
 
-# --- PARSER BRI (METODE TEXT - LEBIH STABIL) ---
+# --- PARSER BRI (REVISI KETERANGAN & MULTILINE) ---
 def parse_bri(pdf):
     data = []
-    # Regex mendeteksi tanggal di awal baris: 01/01/26
-    date_start_pattern = re.compile(r'^(\d{2}/\d{2}/\d{2,4})')
+    current_trx = None
+    
+    # Regex untuk mendeteksi awal baris: Tanggal + Waktu (contoh: 01/01/26 13:15:37)
+    date_time_pattern = re.compile(r'^(\d{2}/\d{2}/\d{2})\s+(\d{2}:\d{2}:\d{2})')
+    # Regex untuk nominal uang format US (contoh: 1,000.00 atau 0.00)
+    money_pattern = re.compile(r'(\d{1,3}(?:,\d{3})*\.\d{2})')
     
     for page in pdf.pages:
-        # Ambil teks mentah, menjaga tata letak visual
-        text = page.extract_text(layout=True)
+        # Gunakan layout=False agar teks yang panjang / turun ke bawah (multiline) lebih mudah ditangkap
+        text = page.extract_text(layout=False)
         if not text: continue
         
         lines = text.split('\n')
         for line in lines:
             line = line.strip()
-            # 1. Cek apakah baris diawali tanggal valid
-            date_match = date_start_pattern.search(line)
-            if date_match:
-                raw_date = date_match.group(1)
+            if not line: continue
+            
+            # Skip baris header tabel
+            if any(x in line for x in ["Tanggal Transaksi", "Transaction Date", "Saldo", "Balance", "Uraian Transaksi", "Halaman", "Page"]):
+                continue
+
+            # 1. Cek apakah baris diawali Tanggal & Waktu
+            dt_match = date_time_pattern.search(line)
+            
+            if dt_match:
+                # Jika ada transaksi sebelumnya yang sedang direkam, simpan dulu
+                if current_trx:
+                    data.append(current_trx)
+                    
+                raw_date = dt_match.group(1)
+                raw_time = dt_match.group(2)
                 
                 # 2. Cari angka format uang di baris ini
-                # Regex ini mencari pola angka seperti: 26,250.00 atau 0.00
-                # Mendukung format 1,000.00 (BRI)
-                money_matches = re.findall(r'(\d{1,3}(?:,\d{3})*\.\d{2})', line)
+                money_matches = money_pattern.findall(line)
                 
-                # Logika BRI: Baris transaksi pasti punya minimal 3 kolom angka di akhir
-                # Urutan dari belakang: [Saldo, Kredit, Debet]
+                # Logika BRI: Baris utama pasti punya 3 angka (Debet, Kredit, Saldo)
                 if len(money_matches) >= 3:
                     saldo_txt = money_matches[-1]
                     kredit_txt = money_matches[-2]
                     debet_txt = money_matches[-3]
                     
-                    # Parse angka (BRI pakai format US: Koma=Ribuan, Titik=Desimal)
                     debet_val = parse_number(debet_txt, is_indo_format=False)
                     kredit_val = parse_number(kredit_txt, is_indo_format=False)
                     
-                    nominal = 0.0
-                    jenis = "CR"
-
-                    if debet_val > 0:
-                        nominal = debet_val
-                        jenis = "DB"
+                    nominal = debet_val if debet_val > 0 else kredit_val
+                    jenis = "DB" if debet_val > 0 else "CR"
+                    
+                    # 3. Ambil Deskripsi Murni
+                    # a. Hapus Tanggal dan Waktu dari depan
+                    temp_line = line.replace(f"{raw_date} {raw_time}", "", 1).strip()
+                    
+                    # b. Hapus ke-3 nominal uang dari belakang
+                    for m in [saldo_txt, kredit_txt, debet_txt]:
+                        temp_line = temp_line.rsplit(m, 1)[0].strip()
+                        
+                    # c. Hapus Teller ID (kata terakhir yang tersisa sebelum angka uang, misal: BRIMDBT atau 8888018)
+                    parts = temp_line.rsplit(' ', 1)
+                    if len(parts) == 2:
+                        clean_desc = parts[0].strip()
                     else:
-                        nominal = kredit_val
-                        jenis = "CR"
-
-                    # 3. Ambil Deskripsi
-                    # Caranya: Hapus Tanggal dari depan, Hapus Angka dari belakang
-                    # Sisa teks di tengah adalah Deskripsi + Teller ID
-                    
-                    # Hapus tanggal
-                    temp_line = line.replace(raw_date, "", 1)
-                    
-                    # Hapus angka-angka transaksi dari string (ambil 3 angka terakhir yg ditemukan)
-                    for m in [debet_txt, kredit_txt, saldo_txt]:
-                        # replace dari kanan (reverse) agar aman jika ada angka sama di deskripsi
-                        temp_line = temp_line.rsplit(m, 1)[0]
-                    
-                    clean_desc = temp_line.strip()
-                    
+                        clean_desc = temp_line.strip()
+                        
                     # 4. Fix Tahun Tanggal (26 -> 2026)
-                    parts = raw_date.split('/')
-                    if len(parts) == 3 and len(parts[2]) == 2:
-                        parts[2] = "20" + parts[2]
-                    final_date = "/".join(parts)
-
-                    data.append({
+                    date_parts = raw_date.split('/')
+                    if len(date_parts) == 3 and len(date_parts[2]) == 2:
+                        date_parts[2] = "20" + date_parts[2]
+                    final_date = "/".join(date_parts)
+                    
+                    current_trx = {
                         "Tanggal": final_date,
                         "Keterangan": clean_desc,
                         "Nominal": nominal,
                         "Jenis": jenis
-                    })
+                    }
+            elif current_trx:
+                # --- PROSES MULTILINE ---
+                # Jika tidak ada pola Tanggal+Waktu di awal baris, ini adalah lanjutan Uraian Transaksi
+                # Contoh: tulisan "ESB:NBMB:0001500F:954688861644"
+                
+                clean_line = " ".join(line.split())
+                if clean_line:
+                    current_trx["Keterangan"] += " " + clean_line
 
+    if current_trx:
+        data.append(current_trx)
+        
     return pd.DataFrame(data)
 
 # --- PARSER PANIN ---
