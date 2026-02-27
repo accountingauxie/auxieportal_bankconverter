@@ -128,11 +128,15 @@ def parse_bri(pdf):
         
     return pd.DataFrame(data)
 
-# --- PARSER PANIN ---
+# --- PARSER PANIN (REVISI DETAIL TRANSAKSI & MULTILINE) ---
 def parse_panin(pdf):
     data = []
     current_trx = None
-    date_regex = re.compile(r'(\d{1,2}-[a-zA-Z]{3}-\d{4})')
+    
+    # Regex untuk tanggal format dd-Mmm-yyyy (contoh: 05-Jan-2026)
+    date_regex = re.compile(r'\b(\d{1,2}-[a-zA-Z]{3}-\d{4})\b')
+    # Regex untuk nominal uang Panin (contoh: 1.509.788.960,59 atau (10.000,00))
+    money_pattern = re.compile(r'\(?\d{1,3}(?:\.\d{3})*,\d{2}\)?')
     saldo_terakhir = None
     
     def parse_panin_num(txt):
@@ -147,23 +151,37 @@ def parse_panin(pdf):
     for page in pdf.pages:
         text = page.extract_text()
         if not text: continue
-        for line in text.split('\n'):
+        
+        lines = text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            
+            # Skip baris header / ringkasan yang tidak relevan
             if any(x in line.upper() for x in ["RINGKASAN AKUN", "MUTASI DEBIT", "MUTASI KREDIT"]):
                 if current_trx: 
                     data.append(current_trx)
                     current_trx = None
                 continue 
                 
+            # Tangkap saldo awal/lalu untuk patokan perhitungan debit/kredit
             if "SALDO" in line.upper():
-                amounts = re.findall(r'(\(?\d{1,3}(?:\.\d{3})*,\d{2}\)?)', line)
+                amounts = money_pattern.findall(line)
                 if amounts and any(x in line.upper() for x in ["AWAL", "LALU", "PINDAH"]):
                     saldo_terakhir = parse_panin_num(amounts[-1]) 
             
-            match = date_regex.search(line)
-            if match:
+            # Cari semua tanggal di baris ini
+            dates_in_line = date_regex.findall(line)
+            
+            # 1. Jika baris mengandung tanggal, ini adalah baris utama transaksi
+            if dates_in_line:
                 if current_trx: data.append(current_trx)
                 
-                amounts = re.findall(r'(\(?\d{1,3}(?:\.\d{3})*,\d{2}\)?)', line)
+                # Ambil Tgl Transaksi (biasanya tanggal pertama)
+                trx_date = dates_in_line[0].replace('-', '/')
+                
+                # Ekstrak semua angka uang di baris ini
+                amounts = money_pattern.findall(line)
                 if len(amounts) >= 2:
                     nominal_txt, saldo_txt = amounts[0], amounts[-1]
                 elif len(amounts) == 1:
@@ -174,6 +192,7 @@ def parse_panin(pdf):
                 nominal_float = abs(parse_panin_num(nominal_txt))
                 saldo_float = parse_panin_num(saldo_txt)
                 
+                # Logika Panin: Tebak jenis Mutasi (DB/CR) berdasarkan selisih saldo
                 jenis = "CR"
                 if saldo_terakhir is not None:
                     if abs(saldo_terakhir - nominal_float - saldo_float) < 1.0:
@@ -189,18 +208,38 @@ def parse_panin(pdf):
                 
                 saldo_terakhir = saldo_float
                 
-                raw_desc = line.replace(match.group(1), "")
-                clean_desc = re.sub(r'\(?\d{1,3}(?:\.\d{3})*,\d{2}\)?', '', raw_desc).strip()
+                # --- PROSES MEMBERSIHKAN KETERANGAN ---
+                temp_line = line
+                # a. Hapus semua tanggal (Tgl Transaksi maupun Tgl Efektif jika ada keduanya di depan)
+                for d in dates_in_line:
+                    temp_line = temp_line.replace(d, "")
+                
+                # b. Hapus semua format nominal uang beserta nilai saldonya dari baris
+                for m in amounts:
+                    temp_line = temp_line.replace(m, "")
+                    
+                # c. Rapikan sisa spasi (Hasil akhir: murni "Detail Transaksi")
+                clean_desc = " ".join(temp_line.split())
                 
                 current_trx = {
-                    "Tanggal": match.group(1).replace('-', '/'),
+                    "Tanggal": trx_date,
                     "Keterangan": clean_desc,
                     "Nominal": nominal_float,
                     "Jenis": jenis
                 }
+                
+            # 2. Jika tidak ada tanggal dan ada transaksi aktif, ini adalah baris lanjutan (Multiline)
             elif current_trx:
-                if not any(x in line.upper() for x in ["HALAMAN", "SALDO", "MATA", "TGL. TRANSAKSI"]):
-                    clean_line = re.sub(r'\(?\d{1,3}(?:\.\d{3})*,\d{2}\)?', '', line).strip()
+                # Pastikan ini bukan baris header tabel
+                if not any(x in line.upper() for x in ["HALAMAN", "SALDO", "MATA", "TGL. TRANSAKSI", "TGL. EFEKTIF", "DETAIL TRANSAKSI", "DEBIT", "KREDIT"]):
+                    temp_line = line
+                    
+                    # Buang nominal uang (jika ada yang terpotong ke bawah)
+                    amounts = money_pattern.findall(temp_line)
+                    for m in amounts:
+                        temp_line = temp_line.replace(m, "")
+                        
+                    clean_line = " ".join(temp_line.split())
                     if clean_line:
                         current_trx["Keterangan"] += " " + clean_line
                 
