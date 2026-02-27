@@ -190,31 +190,75 @@ def parse_panin(pdf):
     if current_trx: data.append(current_trx)
     return pd.DataFrame(data)
 
-# --- PARSER BCA/MANDIRI ---
+# --- PARSER BCA/MANDIRI (REVISI KETERANGAN) ---
 def parse_generic(pdf, year):
     data = []
     current_trx = None
+    # Pola mendeteksi tanggal di awal baris (contoh: 01/01)
     date_ptrn = re.compile(r'^(\d{2}/\d{2})\s')
-    money_ptrn = re.compile(r'(\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2})')
+    # Pola mendeteksi angka uang, mendukung minus untuk saldo (contoh: 14,530,000.00 atau -714,011,582.83)
+    money_ptrn = re.compile(r'-?\d{1,3}(?:,\d{3})*\.\d{2}')
     
     for page in pdf.pages:
-        for line in (page.extract_text() or "").split('\n'):
+        text = page.extract_text()
+        if not text: continue
+        
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line: continue
+
             m = date_ptrn.match(line)
             if m:
+                # Jika ada transaksi sebelumnya yang sedang direkam, simpan dulu
                 if current_trx: data.append(current_trx)
+                
+                raw_date = m.group(1)
                 moneys = money_ptrn.findall(line)
+                
+                # Nominal mutasi biasanya adalah angka uang pertama yang muncul di baris itu
                 nominal_txt = moneys[0] if moneys else "0.00"
                 
+                # --- PROSES MEMBERSIHKAN KETERANGAN ---
+                # 1. Hapus tanggal dari awal kalimat
+                clean_desc = line.replace(raw_date, "", 1).strip()
+                
+                # 2. Hapus semua angka format uang (Mutasi & Saldo) beserta minusnya dari teks keterangan
+                for money in moneys:
+                    clean_desc = clean_desc.replace(money, "")
+                    
+                # 3. Hapus tulisan "DB" atau "CR" yang berdiri sendiri (biasanya penanda debit di BCA)
+                clean_desc = re.sub(r'\b(DB|CR)\b', '', clean_desc)
+                
+                # 4. Hapus kode cabang (CBG) berupa 4 digit angka di akhir teks (contoh: 7910)
+                clean_desc = re.sub(r'\s+\d{4}\s*$', '', clean_desc)
+                
+                # Rapikan spasi berlebih
+                clean_desc = " ".join(clean_desc.split())
+
                 current_trx = {
-                    "Tanggal": f"{m.group(1)}/{year}",
-                    "Keterangan": line.strip(), 
+                    "Tanggal": f"{raw_date}/{year}",
+                    "Keterangan": clean_desc, 
                     "Nominal": parse_number(nominal_txt, is_indo_format=False), 
                     "Jenis": "DB" if "DB" in line.upper() else "CR"
                 }
             elif current_trx:
-                if not any(keyword in line.upper() for keyword in ["SALDO", "MUTASI", "HALAMAN", "PAGE"]):
-                    current_trx["Keterangan"] += " " + line.strip()
+                # Menangkap teks keterangan yang turun ke baris bawah (multiline)
+                # Pastikan ini bukan baris header atau footer tabel
+                if not any(keyword in line.upper() for keyword in ["SALDO", "MUTASI", "HALAMAN", "PAGE", "KETERANGAN", "TANGGAL", "REKENING"]):
+                    clean_line = line
                     
+                    # Buang jika ada angka nominal yang nyasar ke baris kedua
+                    moneys_in_line = money_ptrn.findall(clean_line)
+                    for money in moneys_in_line:
+                        clean_line = clean_line.replace(money, "")
+                    
+                    # Bersihkan sisa-sisa teks yang tidak perlu
+                    clean_line = re.sub(r'\b(DB|CR)\b', '', clean_line)
+                    clean_line = " ".join(clean_line.split())
+                    
+                    if clean_line:
+                        current_trx["Keterangan"] += " " + clean_line
+                        
     if current_trx: data.append(current_trx)
     return pd.DataFrame(data)
 
